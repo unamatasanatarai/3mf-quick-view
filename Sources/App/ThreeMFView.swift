@@ -55,6 +55,7 @@ public final class ThreeMFView: SCNView {
         self.allowsCameraControl = false // We implement custom orbit, pan, and zoom controls
 
         setupCamera()
+        setupGestureRecognizers()
         registerForDraggedTypes([.fileURL])
     }
 
@@ -181,30 +182,112 @@ public final class ThreeMFView: SCNView {
 
     // MARK: - Mouse & Gesture Interaction
     //
-    //   Rotate: left mouse drag
-    //   Pan:    two-finger scroll (trackpad), right mouse drag (also middle drag or modifier + left drag)
+    //   Rotate: left mouse drag  (NSPanGestureRecognizer, primary path; raw mouse events as fallback)
+    //   Pan:    two-finger scroll (trackpad), right mouse drag, middle drag, modifier+left drag
     //   Zoom:   trackpad pinch, or traditional mouse scroll wheel
+    //
+    // NSPanGestureRecognizer is the primary path because it is forwarded correctly through
+    // the QuickLook host-process embedding (Finder column preview) while raw mouseDown/
+    // mouseDragged events are silently swallowed by the QL host before reaching the view.
 
+    // MARK: Gesture recogniser state
+    private var rotateGR: NSPanGestureRecognizer!
+    private var panGR: NSPanGestureRecognizer!
+    private var doubleClickGR: NSClickGestureRecognizer!
+
+    // Track last translation so we can derive per-frame delta from cumulative translation
+    private var lastRotateTranslation: CGPoint = .zero
+    private var lastPanTranslation: CGPoint = .zero
+
+    // Raw-mouse fallback: only active when the gesture recogniser hasn't fired yet
     private enum DragMode { case none, rotate, pan }
     private var dragMode: DragMode = .none
+    private var gestureActive: Bool = false  // true while a GR is in .changed state
 
-    public override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
-        return true
+    private func setupGestureRecognizers() {
+        // Left-button pan → rotate
+        rotateGR = NSPanGestureRecognizer(target: self, action: #selector(handleRotateGesture(_:)))
+        rotateGR.buttonMask = 0x1   // primary (left) button
+        rotateGR.delaysPrimaryMouseButtonEvents = false
+        addGestureRecognizer(rotateGR)
+
+        // Right-button pan → pan camera
+        panGR = NSPanGestureRecognizer(target: self, action: #selector(handlePanGesture(_:)))
+        panGR.buttonMask = 0x2      // secondary (right) button
+        panGR.delaysPrimaryMouseButtonEvents = false
+        addGestureRecognizer(panGR)
+
+        // Double-click → reset view
+        doubleClickGR = NSClickGestureRecognizer(target: self, action: #selector(handleDoubleClick(_:)))
+        doubleClickGR.numberOfClicksRequired = 2
+        doubleClickGR.buttonMask = 0x1
+        addGestureRecognizer(doubleClickGR)
     }
 
-    public override var acceptsFirstResponder: Bool {
-        return true
+    @objc private func handleRotateGesture(_ gr: NSPanGestureRecognizer) {
+        switch gr.state {
+        case .began:
+            lastRotateTranslation = .zero
+            gestureActive = true
+            startInteraction()
+            NSCursor.closedHand.set()
+        case .changed:
+            let t = gr.translation(in: self)
+            let dx = t.x - lastRotateTranslation.x
+            // NSPanGestureRecognizer Y grows downward in view coords, same as deltaY in NSEvent
+            let dy = -(t.y - lastRotateTranslation.y)
+            lastRotateTranslation = t
+            // Modifier check: option/shift/ctrl → pan instead of rotate
+            let panModifiers: NSEvent.ModifierFlags = [.option, .shift, .control]
+            if !NSEvent.modifierFlags.intersection(panModifiers).isEmpty {
+                panCamera(deltaX: dx, deltaY: dy)
+            } else {
+                rotateCamera(deltaX: dx, deltaY: dy)
+            }
+        case .ended, .cancelled, .failed:
+            gestureActive = false
+            endInteractionDebounced()
+            NSCursor.arrow.set()
+        default:
+            break
+        }
     }
 
-    public override func becomeFirstResponder() -> Bool {
-        return true
+    @objc private func handlePanGesture(_ gr: NSPanGestureRecognizer) {
+        switch gr.state {
+        case .began:
+            lastPanTranslation = .zero
+            gestureActive = true
+            startInteraction()
+            NSCursor.openHand.set()
+        case .changed:
+            let t = gr.translation(in: self)
+            let dx = t.x - lastPanTranslation.x
+            let dy = -(t.y - lastPanTranslation.y)
+            lastPanTranslation = t
+            panCamera(deltaX: dx, deltaY: dy)
+        case .ended, .cancelled, .failed:
+            gestureActive = false
+            endInteractionDebounced()
+            NSCursor.arrow.set()
+        default:
+            break
+        }
     }
 
-    public override var mouseDownCanMoveWindow: Bool {
-        return false
+    @objc private func handleDoubleClick(_ gr: NSClickGestureRecognizer) {
+        if gr.state == .ended { resetView() }
     }
 
-    // Active continuous rendering with automatic idle power-down
+    // MARK: Responder properties
+
+    public override func acceptsFirstMouse(for event: NSEvent?) -> Bool { return true }
+    public override var acceptsFirstResponder: Bool { return true }
+    public override func becomeFirstResponder() -> Bool { return true }
+    public override var mouseDownCanMoveWindow: Bool { return false }
+
+    // MARK: Active rendering power management
+
     private var idleTimer: Timer?
 
     private func startInteraction() {
@@ -220,7 +303,10 @@ public final class ThreeMFView: SCNView {
         }
     }
 
+    // MARK: Raw-mouse fallback (standalone app; also fires in QL when GR didn't claim the event)
+
     private func beginDrag(_ mode: DragMode) {
+        guard !gestureActive else { return }  // GR already handling this drag
         dragMode = mode
         startInteraction()
         window?.makeFirstResponder(self)
@@ -228,65 +314,47 @@ public final class ThreeMFView: SCNView {
     }
 
     private func endDrag() {
+        guard !gestureActive else { return }
         dragMode = .none
         endInteractionDebounced()
         NSCursor.arrow.set()
     }
 
     private func handleDrag(_ event: NSEvent) {
+        guard !gestureActive else { return }
         switch dragMode {
         case .rotate: rotateCamera(deltaX: event.deltaX, deltaY: event.deltaY)
-        case .pan: panCamera(deltaX: event.deltaX, deltaY: event.deltaY)
-        case .none: break
+        case .pan:    panCamera(deltaX: event.deltaX, deltaY: event.deltaY)
+        case .none:   break
         }
     }
 
-    // 1. ROTATE: Left Mouse Button Drag (modifier + left drag pans)
+    // 1. ROTATE: Left Mouse Button Drag (raw fallback)
     public override func mouseDown(with event: NSEvent) {
         let panModifiers: NSEvent.ModifierFlags = [.option, .shift, .control]
         let isPan = !event.modifierFlags.intersection(panModifiers).isEmpty
         beginDrag(isPan ? .pan : .rotate)
     }
 
-    public override func mouseDragged(with event: NSEvent) {
-        handleDrag(event)
-    }
+    public override func mouseDragged(with event: NSEvent) { handleDrag(event) }
 
     public override func mouseUp(with event: NSEvent) {
-        if event.clickCount == 2 { resetView() }
+        if event.clickCount == 2 && !gestureActive { resetView() }
         endDrag()
     }
 
-    // 2. PAN: Right Mouse Button Drag
-    public override func rightMouseDown(with event: NSEvent) {
-        beginDrag(.pan)
-    }
-
-    public override func rightMouseDragged(with event: NSEvent) {
-        handleDrag(event)
-    }
-
-    public override func rightMouseUp(with event: NSEvent) {
-        endDrag()
-    }
+    // 2. PAN: Right Mouse Button Drag (raw fallback)
+    public override func rightMouseDown(with event: NSEvent)    { beginDrag(.pan) }
+    public override func rightMouseDragged(with event: NSEvent) { handleDrag(event) }
+    public override func rightMouseUp(with event: NSEvent)      { endDrag() }
 
     // No context menu: right button is reserved for panning
-    public override func menu(for event: NSEvent) -> NSMenu? {
-        return nil
-    }
+    public override func menu(for event: NSEvent) -> NSMenu? { return nil }
 
     // Middle Mouse Drag also pans (CAD convention)
-    public override func otherMouseDown(with event: NSEvent) {
-        beginDrag(.pan)
-    }
-
-    public override func otherMouseDragged(with event: NSEvent) {
-        handleDrag(event)
-    }
-
-    public override func otherMouseUp(with event: NSEvent) {
-        endDrag()
-    }
+    public override func otherMouseDown(with event: NSEvent)    { beginDrag(.pan) }
+    public override func otherMouseDragged(with event: NSEvent) { handleDrag(event) }
+    public override func otherMouseUp(with event: NSEvent)      { endDrag() }
 
 
 

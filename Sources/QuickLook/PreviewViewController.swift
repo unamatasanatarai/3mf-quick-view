@@ -44,30 +44,6 @@ public class PreviewViewController: NSViewController, QLPreviewingController {
         threeMFView?.magnify(with: event)
     }
 
-    public override func mouseDown(with event: NSEvent) {
-        threeMFView?.mouseDown(with: event)
-    }
-
-    public override func mouseDragged(with event: NSEvent) {
-        threeMFView?.mouseDragged(with: event)
-    }
-
-    public override func mouseUp(with event: NSEvent) {
-        threeMFView?.mouseUp(with: event)
-    }
-
-    public override func rightMouseDown(with event: NSEvent) {
-        threeMFView?.rightMouseDown(with: event)
-    }
-
-    public override func rightMouseDragged(with event: NSEvent) {
-        threeMFView?.rightMouseDragged(with: event)
-    }
-
-    public override func rightMouseUp(with event: NSEvent) {
-        threeMFView?.rightMouseUp(with: event)
-    }
-
     // MARK: - QLPreviewingController
 
     @objc public func preparePreviewOfFile(at url: URL, completionHandler handler: @escaping (Error?) -> Void) {
